@@ -51,6 +51,8 @@ public class TspFrame extends JFrame {
     if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
     File f = chooser.getSelectedFile();
     try {
+      // Load the file into the problem repository
+      TspProblemRepository.getInstance().loadFromFile(f);
       cities = TspParser.load(f);
       tour = List.of();
       mapPanel.setCities(cities);
