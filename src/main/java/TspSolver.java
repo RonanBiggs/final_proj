@@ -8,7 +8,7 @@ import java.util.List;
  * The consumer is gated by Semaphore B (filled slots) inside the repository:
  * it blocks on {@code getNextProblem()} when the buffer is empty, consuming
  * zero CPU while it waits. When a result is ready it fires a "result" property
- * change on the repository; {@link TspFrame} listens for this and updates the
+ * change on the repository; {@link TspFrameOld} listens for this and updates the
  * UI on the EDT via SwingUtilities.invokeLater.
  *
  * Design note: this thread runs in an infinite loop with a volatile flag so
