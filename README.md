@@ -5,6 +5,6 @@ Producer- Ryan Schmitt
 Consumer - Ryan Schmitt
 
 RemoteConsumer - Ronan
-Some UI - Ronan
+outsourcer - Ronan
 idk what else is left but i can do a couple other things.
 
