@@ -21,7 +21,7 @@ import java.util.List;
  *   Modified to use a DelegatePanel instead of a MapPanel.
  *   Modified to use a TspProblemRepository instead of a TspProblem.
  */
-public class TspFrame extends JFrame implements PropertyChangeListener {
+public class TspFrameOld extends JFrame implements PropertyChangeListener {
 
   // How many solver (consumer) threads to run in parallel.
   private static final int SOLVER_COUNT = Runtime.getRuntime().availableProcessors();
@@ -37,7 +37,7 @@ public class TspFrame extends JFrame implements PropertyChangeListener {
   // Track running solver threads so we can interrupt them on close.
   private final List<Thread> solverThreads = new ArrayList<>();
 
-  public TspFrame() {
+  public TspFrameOld() {
     super("TSP — Producer-Consumer");
     buildUI();
     startSolvers();
