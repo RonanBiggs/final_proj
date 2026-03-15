@@ -1,6 +1,3 @@
-package tsp;
-
-
 import java.util.*;
 
 /**

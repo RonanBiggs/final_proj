@@ -1,5 +1,3 @@
-package tsp;
-
 import java.util.List;
 
 /**
