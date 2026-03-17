@@ -7,73 +7,76 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Remote MQTT worker: subscribes to a wildcard task topic that matches every
- * session's tasks, solves each sub-problem, and publishes the result to the
- * per-session result topic embedded in the task payload.
+ * Remote MQTT worker that requests a fixed batch of tasks at a time.
  *
- * <h3>Session isolation</h3>
- * Workers subscribe to {@code $share/tsp-workers/tsp/+/tasks}, where {@code +}
- * is a single-level wildcard that matches any session UUID. Each task payload
- * contains a {@code resultTopic} field that tells the worker exactly where to
- * publish its answer (e.g. {@code tsp/abc-123/results}). This means:
- * <ul>
- *   <li>Workers automatically handle tasks from any session without reconfiguration.</li>
- *   <li>If the orchestrator was restarted, its old session UUID is gone; results
- *       published to the old {@code resultTopic} have no subscriber and are
- *       silently dropped — they never pollute the new run.</li>
- * </ul>
+ * <h3>Protocol</h3>
+ * <ol>
+ *   <li>Worker publishes a request to {@code tsp/<session>/requests}:
+ *       {@code workerId=<label>  capacity=<n>  taskTopic=tsp/<session>/worker/<label>/tasks}</li>
+ *   <li>Outsourcer receives the request, dequeues {@code n} tasks, and publishes
+ *       each to {@code tsp/<session>/worker/<label>/tasks}.</li>
+ *   <li>Worker solves each task and publishes results to {@code tsp/<session>/results}.</li>
+ *   <li>Once all tasks in the batch are done, worker publishes another request.</li>
+ * </ol>
  *
- * <h3>Unique worker IDs</h3>
- * {@code hostname + "-" + UUID} guarantees global uniqueness with zero config.
- *
- * <h3>Running standalone</h3>
- * <pre>
- *   java -cp .:paho-mqtt.jar RemoteWorker [brokerUrl] [workerCount]
- *
- *   Examples:
- *     java -cp .:paho-mqtt.jar RemoteWorker
- *     java -cp .:paho-mqtt.jar RemoteWorker tcp://broker.hivemq.com:1883 4
- *     java -cp .:paho-mqtt.jar RemoteWorker tcp://192.168.1.10:1883 2
- * </pre>
+ * <h3>Batch size</h3>
+ * Set {@code TASK_BATCH_SIZE} before running. Each worker can have a different value.
  *
  * @author javiergs / ryanschmitt
- * @version 4.0
+ * @version 6.0
  */
 public class RemoteWorker implements Runnable, MqttCallback, AutoCloseable {
 
-  // Wildcard subscription — catches tasks from any session UUID.
-  // The shared-subscription prefix ensures each message goes to exactly one worker.
-  public static final String TASK_SUBSCRIPTION = "$share/tsp-workers/tsp/+/tasks";
+  // ---- Configure these per-worker ------------------------------------------
+  /** How many tasks to request at once. Change this per worker as needed. */
+  private static final int TASK_BATCH_SIZE = 4;
 
-  private static final String DEFAULT_BROKER = "tcp://broker.hivemq.com:1883";
+  private static final String DEFAULT_BROKER     = "tcp://broker.hivemq.com:1883";
+  private static final String DEFAULT_SESSION_ID = "dolphin24";
+  // --------------------------------------------------------------------------
+
+  private static final AtomicInteger NEXT_ID = new AtomicInteger(1);
 
   private final String brokerUrl;
-  private final String workerId;
+  private final String sessionId;
+  private final String label;       // e.g. "Remote-1"
+  private final String mqttId;      // full unique MQTT client ID
+  private final int    batchSize;
+  private final String requestTopic;  // tsp/<session>/requests
+  private final String myTaskTopic;   // tsp/<session>/worker/<label>/tasks
+  private final String resultTopic;   // tsp/<session>/results
   private final MqttClient client;
   private volatile boolean running = true;
 
-  // -------------------------------------------------------------------------
-  // Constructor
-  // -------------------------------------------------------------------------
+  /** Tasks received in the current batch that haven't been solved yet. */
+  private final AtomicInteger pendingInBatch = new AtomicInteger(0);
 
-  public RemoteWorker(String brokerUrl, String workerId) throws MqttException {
-    this.brokerUrl = brokerUrl;
-    this.workerId  = workerId;
-    this.client    = new MqttClient(brokerUrl, workerId);
+  public RemoteWorker(String brokerUrl, String sessionId, String label,
+                      String mqttId, int batchSize) throws MqttException {
+    this.brokerUrl     = brokerUrl;
+    this.sessionId     = sessionId;
+    this.label         = label;
+    this.mqttId        = mqttId;
+    this.batchSize     = batchSize;
+    this.requestTopic  = "tsp/" + sessionId + "/requests";
+    this.myTaskTopic   = "tsp/" + sessionId + "/worker/" + label + "/tasks";
+    this.resultTopic   = "tsp/" + sessionId + "/results";
+    this.client        = new MqttClient(brokerUrl, mqttId);
     this.client.setCallback(this);
   }
 
-  /** Builds a globally unique worker ID: {@code hostname-UUID}. */
-  public static String generateUniqueId() {
+  /** Factory — sequential label, unique MQTT ID, configurable batch size. */
+  public static RemoteWorker create(String brokerUrl, String sessionId,
+                                    int batchSize) throws MqttException {
     String host;
-    try {
-      host = InetAddress.getLocalHost().getHostName();
-    } catch (Exception e) {
-      host = "unknown-host";
-    }
-    return host + "-" + UUID.randomUUID();
+    try { host = InetAddress.getLocalHost().getHostName(); }
+    catch (Exception e) { host = "host"; }
+    String label  = "Remote-" + NEXT_ID.getAndIncrement();
+    String mqttId = host + "-" + UUID.randomUUID();
+    return new RemoteWorker(brokerUrl, sessionId, label, mqttId, batchSize);
   }
 
   // -------------------------------------------------------------------------
@@ -86,28 +89,43 @@ public class RemoteWorker implements Runnable, MqttCallback, AutoCloseable {
       MqttConnectOptions options = new MqttConnectOptions();
       options.setAutomaticReconnect(true);
       options.setCleanSession(true);
-
       client.connect(options);
-      client.subscribe(TASK_SUBSCRIPTION, 1);
 
-      System.out.println("[" + workerId + "] Connected to broker    : " + brokerUrl);
-      System.out.println("[" + workerId + "] Subscribed to tasks    : " + TASK_SUBSCRIPTION);
-      System.out.println("[" + workerId + "] Result topic read from task payload (per-session)");
-      System.out.println("[" + workerId + "] Ready — waiting for tasks...");
+      // Subscribe to our personal task topic
+      client.subscribe(myTaskTopic, 1);
 
-      // Keep alive — work is done in messageArrived()
+      System.out.printf("[%s] Connected to %s%n", label, brokerUrl);
+      System.out.printf("[%s] Session    : %s%n", label, sessionId);
+      System.out.printf("[%s] Task topic : %s%n", label, myTaskTopic);
+      System.out.printf("[%s] Batch size : %d%n", label, batchSize);
+
+      // Send the first request
+      publishRequest();
+
       while (running && client.isConnected()) {
-        try { Thread.sleep(1000); }
+        try { Thread.sleep(500); }
         catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
       }
 
     } catch (MqttException e) {
-      System.err.println("[" + workerId + "] Failed to start: " + e.getMessage());
+      System.err.printf("[%s] Failed to start: %s%n", label, e.getMessage());
       e.printStackTrace();
     } finally {
       try { close(); } catch (Exception ignored) { }
-      System.out.println("[" + workerId + "] Stopped.");
+      System.out.printf("[%s] Stopped.%n", label);
     }
+  }
+
+  /** Publishes a task request to the session request topic. */
+  private void publishRequest() throws MqttException {
+    String payload = "workerId=" + escape(label) + "\n"
+        + "capacity=" + batchSize + "\n"
+        + "taskTopic=" + escape(myTaskTopic) + "\n";
+    MqttMessage msg = new MqttMessage(payload.getBytes(StandardCharsets.UTF_8));
+    msg.setQos(1);
+    client.publish(requestTopic, msg);
+    System.out.printf("[%s] Requested %d tasks from [%s]%n",
+        label, batchSize, sessionId);
   }
 
   public void stop() { running = false; }
@@ -118,8 +136,8 @@ public class RemoteWorker implements Runnable, MqttCallback, AutoCloseable {
 
   @Override
   public void connectionLost(Throwable cause) {
-    System.err.println("[" + workerId + "] Connection lost: " +
-        (cause == null ? "unknown" : cause.getMessage()));
+    System.err.printf("[%s] Connection lost: %s%n", label,
+        cause == null ? "unknown" : cause.getMessage());
   }
 
   @Override
@@ -127,33 +145,35 @@ public class RemoteWorker implements Runnable, MqttCallback, AutoCloseable {
     try {
       String payload    = new String(message.getPayload(), StandardCharsets.UTF_8);
       WorkItem workItem = decodeWorkItem(payload);
+      pendingInBatch.incrementAndGet();
 
-      System.out.printf("[RECEIVED] worker=%s  requestId=%s  problem=%s  start=%d  cities=%d  replyTo=%s%n",
-          workerId, workItem.requestId, workItem.problem.getName(),
-          workItem.problem.getStartIndex(), workItem.problem.getCities().size(),
-          workItem.resultTopic);
+      System.out.printf("[Receive]  (remote) %-12s  [%s]  problem=%s  start=%d%n",
+          label, sessionId, workItem.problem.getName(), workItem.problem.getStartIndex());
 
-      // Solve from the designated starting city
       List<Integer> tour = NearestNeighborSolver.solve(
           workItem.problem.getCities(), workItem.problem.getStartIndex());
       double length = NearestNeighborSolver.length(workItem.problem.getCities(), tour);
 
-      System.out.printf("[SOLVED]   worker=%s  requestId=%s  problem=%s  start=%d  length=%.3f%n",
-          workerId, workItem.requestId, workItem.problem.getName(),
-          workItem.problem.getStartIndex(), length);
+      System.out.printf("[Solving]  (remote) %-12s  [%s]  problem=%s  start=%d%n",
+          label, sessionId, workItem.problem.getName(), workItem.problem.getStartIndex());
 
-      // Publish result to the session-specific result topic from the task payload
-      String resultPayload = encodeResult(workItem.requestId, workerId,
+      String resultPayload = encodeResult(workItem.requestId, label,
                                           workItem.problem, tour, length);
       MqttMessage resultMsg = new MqttMessage(resultPayload.getBytes(StandardCharsets.UTF_8));
       resultMsg.setQos(1);
-      client.publish(workItem.resultTopic, resultMsg);
+      client.publish(resultTopic, resultMsg);
 
-      System.out.printf("[PUBLISHED] worker=%s  requestId=%s  topic=%s%n",
-          workerId, workItem.requestId, workItem.resultTopic);
+      System.out.printf("[Submit]   (remote) %-12s  [%s]  problem=%s  start=%d  length=%.3f%n",
+          label, sessionId, workItem.problem.getName(), workItem.problem.getStartIndex(), length);
+
+      // If all tasks in this batch are done, request the next batch
+      if (pendingInBatch.decrementAndGet() == 0) {
+        System.out.printf("[%s] Batch complete — requesting next %d tasks%n", label, batchSize);
+        publishRequest();
+      }
 
     } catch (Exception e) {
-      System.err.println("[" + workerId + "] Error processing task: " + e.getMessage());
+      System.err.printf("[%s] Error processing task: %s%n", label, e.getMessage());
       e.printStackTrace();
     }
   }
@@ -196,15 +216,14 @@ public class RemoteWorker implements Runnable, MqttCallback, AutoCloseable {
   }
 
   private static WorkItem decodeWorkItem(String payload) {
-    String[] lines    = payload.split("\\R");
-    String requestId  = unescape(valueOf(lines[0], "requestId="));
-    String name       = unescape(valueOf(lines[1], "name="));
-    int startIndex    = Integer.parseInt(valueOf(lines[2], "startIndex="));
-    String resultTopic = unescape(valueOf(lines[3], "resultTopic="));
-    int cityCount     = Integer.parseInt(valueOf(lines[4], "cityCount="));
+    String[] lines   = payload.split("\\R");
+    String requestId = unescape(valueOf(lines[0], "requestId="));
+    String name      = unescape(valueOf(lines[1], "name="));
+    int startIndex   = Integer.parseInt(valueOf(lines[2], "startIndex="));
+    int cityCount    = Integer.parseInt(valueOf(lines[3], "cityCount="));
 
     List<City> cities = new ArrayList<>();
-    int idx = 5;
+    int idx = 4;
     for (int i = 0; i < cityCount; i++, idx++) {
       String[] parts = lines[idx].split("\\|");
       cities.add(new City(
@@ -212,7 +231,7 @@ public class RemoteWorker implements Runnable, MqttCallback, AutoCloseable {
           Double.parseDouble(parts[1]),
           Double.parseDouble(parts[2])));
     }
-    return new WorkItem(requestId, new TspProblem(name, cities, startIndex), resultTopic);
+    return new WorkItem(requestId, new TspProblem(name, cities, startIndex));
   }
 
   private static String valueOf(String line, String prefix) {
@@ -224,19 +243,12 @@ public class RemoteWorker implements Runnable, MqttCallback, AutoCloseable {
   private static String escape(String v)   { return URLEncoder.encode(v, StandardCharsets.UTF_8); }
   private static String unescape(String v) { return URLDecoder.decode(v, StandardCharsets.UTF_8); }
 
-  // -------------------------------------------------------------------------
-  // Inner type
-  // -------------------------------------------------------------------------
-
   private static class WorkItem {
     final String requestId;
     final TspProblem problem;
-    final String resultTopic;  // session-specific, read from task payload
-
-    WorkItem(String requestId, TspProblem problem, String resultTopic) {
-      this.requestId   = requestId;
-      this.problem     = problem;
-      this.resultTopic = resultTopic;
+    WorkItem(String requestId, TspProblem problem) {
+      this.requestId = requestId;
+      this.problem   = problem;
     }
   }
 
@@ -245,34 +257,33 @@ public class RemoteWorker implements Runnable, MqttCallback, AutoCloseable {
   // -------------------------------------------------------------------------
 
   /**
-   * Launch one or more remote workers from any machine.
-   *
    * <pre>
-   *   Usage: java -cp .:paho-mqtt.jar RemoteWorker [brokerUrl] [workerCount]
+   *   Usage: java -cp .:paho-mqtt.jar RemoteWorker [brokerUrl] [sessionId] [batchSize] [workerCount]
    *
-   *   brokerUrl   — MQTT broker URI          (default: tcp://broker.hivemq.com:1883)
-   *   workerCount — parallel worker threads  (default: 1)
+   *   brokerUrl   — default: tcp://broker.hivemq.com:1883
+   *   sessionId   — default: dolphin22
+   *   batchSize   — tasks requested at once, default: 4
+   *   workerCount — parallel workers in this JVM, default: 1
+   *
+   *   Examples:
+   *     java -cp .:paho-mqtt.jar RemoteWorker
+   *     java -cp .:paho-mqtt.jar RemoteWorker tcp://broker.hivemq.com:1883 dolphin22 5 2
    * </pre>
    */
   public static void main(String[] args) throws Exception {
     String brokerUrl   = args.length > 0 ? args[0] : DEFAULT_BROKER;
-    int    workerCount = args.length > 1 ? Integer.parseInt(args[1]) : 1;
+    String sessionId   = args.length > 1 ? args[1] : DEFAULT_SESSION_ID;
+    int    batchSize   = args.length > 2 ? Integer.parseInt(args[2]) : TASK_BATCH_SIZE;
+    int    workerCount = args.length > 3 ? Integer.parseInt(args[3]) : 1;
 
-    System.out.println("╔══════════════════════════════════════╗");
-    System.out.println("║       TSP Distributed RemoteWorker   ║");
-    System.out.println("╠══════════════════════════════════════╣");
-    System.out.printf( "║  Broker      : %-22s ║%n", brokerUrl);
-    System.out.printf( "║  Workers     : %-22d ║%n", workerCount);
-    System.out.printf( "║  Subscribing : %-22s ║%n", TASK_SUBSCRIPTION);
-    System.out.println("╚══════════════════════════════════════╝");
+    System.out.printf("TSP RemoteWorker  broker=%s  session=%s  batchSize=%d  workers=%d%n",
+        brokerUrl, sessionId, batchSize, workerCount);
 
     for (int i = 0; i < workerCount; i++) {
-      String id = generateUniqueId();
-      RemoteWorker worker = new RemoteWorker(brokerUrl, id);
-      Thread t = new Thread(worker, "RemoteWorker-" + i);
-      t.setDaemon(false);  // keep JVM alive
+      RemoteWorker worker = RemoteWorker.create(brokerUrl, sessionId, batchSize);
+      Thread t = new Thread(worker, worker.label);
+      t.setDaemon(false);
       t.start();
-      System.out.println("[main] Started worker: " + id);
     }
   }
 }

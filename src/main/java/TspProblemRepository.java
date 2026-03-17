@@ -209,9 +209,9 @@ public class TspProblemRepository extends PropertyChangeSupport {
     if (completed != null) {
       int done = completed.incrementAndGet();
       int tot  = total != null ? total.get() : -1;
-      System.out.printf("[Repository] %s  %d/%d done%s%n",
+      System.out.printf("[Progress] %s  %d/%d%s%n",
           name, done, tot,
-          isBest ? "  ★ new best: " + String.format("%.3f", result.getLength()) : "");
+          isBest ? "  ★ " + String.format("%.3f", result.getLength()) : "");
     }
   }
 
