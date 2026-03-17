@@ -35,7 +35,7 @@ public class RemoteWorker implements Runnable, MqttCallback, AutoCloseable {
   private static final int TASK_BATCH_SIZE = 4;
 
   private static final String DEFAULT_BROKER     = "tcp://broker.hivemq.com:1883";
-  private static final String DEFAULT_SESSION_ID = "dolphin24";
+  private static final String DEFAULT_SESSION_ID = "dolphin27";
   // --------------------------------------------------------------------------
 
   private static final AtomicInteger NEXT_ID = new AtomicInteger(1);
@@ -271,10 +271,10 @@ public class RemoteWorker implements Runnable, MqttCallback, AutoCloseable {
    * </pre>
    */
   public static void main(String[] args) throws Exception {
-    String brokerUrl   = args.length > 0 ? args[0] : DEFAULT_BROKER;
-    String sessionId   = args.length > 1 ? args[1] : DEFAULT_SESSION_ID;
-    int    batchSize   = args.length > 2 ? Integer.parseInt(args[2]) : TASK_BATCH_SIZE;
-    int    workerCount = args.length > 3 ? Integer.parseInt(args[3]) : 1;
+    String brokerUrl   = DEFAULT_BROKER;
+    String sessionId   = DEFAULT_SESSION_ID;
+    int    batchSize   = 4;
+    int    workerCount = 1;
 
     System.out.printf("TSP RemoteWorker  broker=%s  session=%s  batchSize=%d  workers=%d%n",
         brokerUrl, sessionId, batchSize, workerCount);

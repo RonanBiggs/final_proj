@@ -17,12 +17,12 @@ import java.util.concurrent.ConcurrentHashMap;
 public class TspFrame extends JFrame implements PropertyChangeListener {
 
   private static final String MQTT_BROKER            = "tcp://broker.hivemq.com:1883";
-  private static final int    LOCAL_SOLVER_COUNT      = 2;
-  private static final int    REMOTE_WORKER_COUNT     = 2;  // in-process remote workers
+  private static final int    LOCAL_SOLVER_COUNT      = 10;
+  private static final int    REMOTE_WORKER_COUNT     = 0;  // in-process remote workers
   /** How many tasks each in-process remote worker requests at a time. */
   private static final int    REMOTE_TASK_BATCH_SIZE  = 5;
 
-  private static final String SESSION_ID  = "dolphin24";
+  private static final String SESSION_ID  = "dolphin27";
   private static final String SESSION_TAG = SESSION_ID.length() >= 8
       ? SESSION_ID.substring(0, 8) : SESSION_ID;
 
