@@ -1,150 +1,260 @@
 import java.beans.PropertyChangeSupport;
 import java.io.File;
 import java.io.IOException;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Queue;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
-// Note: TspResult and NearestNeighborSolver are intentionally NOT imported here.
-// The repository is a pure buffer; solving is the consumer's (TspSolver's) job.
-
 /**
- * Singleton buffer that holds TSP problems waiting to be solved.
+ * Singleton buffer holding TSP sub-problems in a single shared queue.
  *
- * This class is the shared buffer in the Producer-Consumer pattern:
- * 
- *  {@link TspProducer} threads call {@link #produce} to enqueue work.</li>
- *  {@link TspSolver} threads call {@link #getNextProblem} to dequeue it.</li>
- * 
+ * <h3>Architecture</h3>
+ * <pre>
+ *   TspProducer ──► [sharedQueue] ──► TspSolver threads  (local, pull directly)
+ *                        │
+ *                        └──────────► Outsourcer          (also pulls, publishes to MQTT)
+ *                                         │  result arrives
+ *                                         ▼
+ *                                   submitResult()  ◄── RemoteWorker (via MQTT)
+ * </pre>
  *
- * <p>Thread safety is enforced by two semaphores and a reentrant lock,
- * mirroring the six-step semaphore dance from the lecture:
- * <ol>
- *   <li>Producer acquires {@code empty} (Semaphore A) — blocks if buffer full.</li>
- *   <li>Producer acquires the lock, enqueues, releases the lock.</li>
- *   <li>Producer releases {@code full} (Semaphore B) — signals consumer.</li>
- *   <li>Consumer acquires {@code full} (Semaphore B) — blocks if buffer empty.</li>
- *   <li>Consumer acquires the lock, dequeues, releases the lock.</li>
- *   <li>Consumer releases {@code empty} (Semaphore A) — signals producer.</li>
- * </ol>
- *
- * <p>This class also acts as the event bus for the whole application.
- * Threads fire named events here; the GUI subscribes and dispatches
- * UI updates to the EDT via {@code SwingUtilities.invokeLater}.
- * Known event property names are declared as public constants below.
- *
- * <h3>Changes from v1</h3>
+ * Both local solvers and the Outsourcer compete for tasks from the same queue.
+ * This means every task is attempted by whichever consumer grabs it first:
  * <ul>
- *   <li>Added {@link #EVENT_RESULT} and {@link #EVENT_ERROR} constants so
- *       listeners can use string literals safely.</li>
- *   <li>Made {@link #firePropertyChange(String, Object, Object)} public so
- *       {@link TspProducer} and {@link TspSolver} can fire events without
- *       needing a separate event-bus reference.</li>
- *   <li>No changes to the buffer logic or semaphore protocol.</li>
+ *   <li>If a local solver grabs it, it is solved locally.</li>
+ *   <li>If the Outsourcer grabs it, it is published to a remote worker.
+ *       The Outsourcer waits asynchronously; if no result arrives within the
+ *       timeout it falls back to solving locally via {@link #requeueLocally}.</li>
  * </ul>
+ * {@link #submitResult} uses a best-result tracker, so if both a local and a
+ * remote worker somehow solve the same task (e.g. race before fallback fires)
+ * only the shorter tour is kept — no double-counting occurs.
+ *
+ * <h3>Semaphore protocol (six-step)</h3>
+ * <ol>
+ *   <li>Producer acquires {@code empty} — blocks if queue full.</li>
+ *   <li>Producer locks, enqueues, unlocks.</li>
+ *   <li>Producer releases {@code full} — signals any consumer.</li>
+ *   <li>Consumer (solver or outsourcer) acquires {@code full}.</li>
+ *   <li>Consumer locks, dequeues, unlocks.</li>
+ *   <li>Consumer releases {@code empty} — signals producer.</li>
+ * </ol>
+ * The fallback local queue uses an identical independent protocol.
  *
  * @author ryanschmitt
- * @version 3.0
+ * @version 6.0
  */
 public class TspProblemRepository extends PropertyChangeSupport {
 
-  /** Fired by {@link TspSolver} when a problem has been solved. Value: {@link TspResult}. */
-  public static final String EVENT_RESULT = "result";
+  public static final String EVENT_RESULT      = "result";
+  public static final String EVENT_BEST_RESULT = "bestResult";
+  public static final String EVENT_BATCH       = "batch";
+  public static final String EVENT_ERROR       = "error";
+  public static final String EVENT_PROBLEM     = "problems";
 
-  /** Fired by {@link TspProducer} when a file cannot be parsed. Value: error message String. */
-  public static final String EVENT_ERROR = "error";
+  private static final int CAPACITY = 2000;
 
-  /** Fired by {@link #produce} when a problem is enqueued. Value: {@link TspProblem}. */
-  public static final String EVENT_PROBLEM = "problems";
-
-  private static final int CAPACITY = 10;
   private static final TspProblemRepository instance = new TspProblemRepository();
 
-  private final Queue<TspProblem> problems = new LinkedList<>();
-  private final Semaphore empty = new Semaphore(CAPACITY); // Semaphore A: empty slots
-  private final Semaphore full  = new Semaphore(0);        // Semaphore B: filled slots
-  private final Lock lock = new ReentrantLock();
+  // ---- Shared queue (Producer → TspSolver threads AND Outsourcer) ----------
+  private final Queue<TspProblem> sharedQueue = new LinkedList<>();
+  private final Semaphore emptyShared = new Semaphore(CAPACITY);
+  private final Semaphore fullShared  = new Semaphore(0);
+  private final Lock      sharedLock  = new ReentrantLock();
 
-  private TspProblemRepository() {
-    super(new Object());
+  // ---- Fallback local queue (Outsourcer timeout → TspSolver threads) -------
+  private final Queue<TspProblem> localQueue  = new LinkedList<>();
+  private final Semaphore emptyLocal = new Semaphore(CAPACITY);
+  private final Semaphore fullLocal  = new Semaphore(0);
+  private final Lock      localLock  = new ReentrantLock();
+
+  // ---- Best-result tracking ------------------------------------------------
+  private final Map<String, TspResult>     bestResults     = new ConcurrentHashMap<>();
+  private final Map<String, AtomicInteger> totalCounts     = new ConcurrentHashMap<>();
+  private final Map<String, AtomicInteger> completedCounts = new ConcurrentHashMap<>();
+
+  private TspProblemRepository() { super(new Object()); }
+
+  public static TspProblemRepository getInstance() { return instance; }
+
+  // -------------------------------------------------------------------------
+  // Batch registration
+  // -------------------------------------------------------------------------
+
+  public void registerBatch(String problemName, int total) {
+    totalCounts.put(problemName, new AtomicInteger(total));
+    completedCounts.put(problemName, new AtomicInteger(0));
+    bestResults.remove(problemName);
+    firePropertyChange(EVENT_BATCH, null, new BatchInfo(problemName, total));
   }
 
-  public static TspProblemRepository getInstance() {
-    return instance;
-  }
+  // -------------------------------------------------------------------------
+  // Producer → shared queue
+  // -------------------------------------------------------------------------
 
-  /**
-   * Parses a .tsp file and enqueues it as a problem.
-   *
-   * @param file the TSPLIB file to load
-   * @throws IOException          if the file cannot be parsed
-   * @throws InterruptedException if the thread is interrupted while waiting for space
-   */
   public void loadFromFile(File file) throws IOException, InterruptedException {
     String name = file.getName().replaceFirst("\\.tsp$", "");
     List<City> cities = TspParser.load(file);
-    produce(new TspProblem(name, cities));
+    registerBatch(name, cities.size());
+    for (int i = 0; i < cities.size(); i++) {
+      produce(new TspProblem(name, cities, i));
+    }
   }
 
   /**
-   * Enqueues a pre-built problem. Blocks if the repository is at capacity.
-   * (Step 1-3 of the semaphore protocol.)
-   *
-   * @throws InterruptedException if the thread is interrupted while waiting for space
+   * Enqueues into the shared queue. Both local solvers and the Outsourcer
+   * compete to consume from here. Steps 1-3 of the semaphore protocol.
    */
   public void produce(TspProblem problem) throws InterruptedException {
-    empty.acquire();               // Step 1: wait for an empty slot (Semaphore A)
-    lock.lock();                   // Step 2a: acquire buffer lock
+    emptyShared.acquire();
+    sharedLock.lock();
     try {
-      problems.add(problem);
+      sharedQueue.add(problem);
       firePropertyChange(EVENT_PROBLEM, null, problem);
     } finally {
-      lock.unlock();               // Step 2b: release buffer lock
+      sharedLock.unlock();
     }
-    full.release();                // Step 3: signal consumer (Semaphore B++)
+    fullShared.release();
   }
 
+  // -------------------------------------------------------------------------
+  // Shared consumer (used by BOTH TspSolver and Outsourcer)
+  // -------------------------------------------------------------------------
+
   /**
-   * Dequeues and returns the next problem to solve. Blocks until one is available.
-   * (Steps 4-6 of the semaphore protocol.)
-   *
-   * Note: solving is intentionally NOT done here. The repository is only a buffer —
-   * keeping it free of business logic means it stays easy to test and reuse.
-   * {@link TspSolver} does the heavy lifting after dequeuing.
-   *
-   * @throws InterruptedException if the thread is interrupted while waiting
+   * Dequeues the next sub-problem. Whichever thread calls this first — a
+   * local solver or the Outsourcer — gets the task. Blocks until one is
+   * available. Steps 4-6 of the semaphore protocol.
    */
   public TspProblem getNextProblem() throws InterruptedException {
-    full.acquire();                // Step 4: wait for a filled slot (Semaphore B)
+    fullShared.acquire();
     TspProblem problem;
-    lock.lock();                   // Step 5a: acquire buffer lock
+    sharedLock.lock();
     try {
-      problem = problems.remove();
+      problem = sharedQueue.remove();
     } finally {
-      lock.unlock();               // Step 5b: release buffer lock
+      sharedLock.unlock();
     }
-    empty.release();               // Step 6: signal producer (Semaphore A++)
+    emptyShared.release();
     return problem;
   }
 
-  public int size() {
-    lock.lock();
+  // -------------------------------------------------------------------------
+  // Fallback local queue (Outsourcer timeout path)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Called by the Outsourcer when a remote task times out. Moves the problem
+   * into the fallback local queue so a TspSolver thread can handle it.
+   * Steps 1-3 of the local semaphore protocol.
+   */
+  public void requeueLocally(TspProblem problem) throws InterruptedException {
+    emptyLocal.acquire();
+    localLock.lock();
     try {
-      return problems.size();
+      localQueue.add(problem);
     } finally {
-      lock.unlock();
+      localLock.unlock();
     }
+    fullLocal.release();
   }
 
   /**
-   * Exposed as public so producer/solver threads can fire events on the shared
-   * repository without needing a separate event bus reference.
+   * Dequeues from the fallback local queue. Used by TspSolver threads when
+   * they have no shared-queue work. Steps 4-6 of the local semaphore protocol.
    */
+  public TspProblem getNextLocalFallback() throws InterruptedException {
+    fullLocal.acquire();
+    TspProblem problem;
+    localLock.lock();
+    try {
+      problem = localQueue.remove();
+    } finally {
+      localLock.unlock();
+    }
+    emptyLocal.release();
+    return problem;
+  }
+
+  // -------------------------------------------------------------------------
+  // Result submission
+  // -------------------------------------------------------------------------
+
+  /**
+   * Submit a completed result. Always fires EVENT_RESULT for progress
+   * counting. Fires EVENT_BEST_RESULT only when this beats the current best.
+   * Safe to call from multiple threads for the same sub-problem — only the
+   * shorter tour wins.
+   */
+  public void submitResult(TspResult result) {
+    String name = result.getProblem().getName();
+    firePropertyChange(EVENT_RESULT, null, result);
+
+    boolean isBest = false;
+    TspResult previous;
+    synchronized (bestResults) {
+      previous = bestResults.get(name);
+      if (previous == null || result.getLength() < previous.getLength()) {
+        bestResults.put(name, result);
+        isBest = true;
+      }
+    }
+    if (isBest) firePropertyChange(EVENT_BEST_RESULT, previous, result);
+
+    AtomicInteger completed = completedCounts.get(name);
+    AtomicInteger total     = totalCounts.get(name);
+    if (completed != null) {
+      int done = completed.incrementAndGet();
+      int tot  = total != null ? total.get() : -1;
+      System.out.printf("[Repository] %s  %d/%d done%s%n",
+          name, done, tot,
+          isBest ? "  ★ new best: " + String.format("%.3f", result.getLength()) : "");
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Accessors
+  // -------------------------------------------------------------------------
+
+  public int sharedQueueSize() {
+    sharedLock.lock();
+    try { return sharedQueue.size(); } finally { sharedLock.unlock(); }
+  }
+
+  public int localQueueSize() {
+    localLock.lock();
+    try { return localQueue.size(); } finally { localLock.unlock(); }
+  }
+
+  public Optional<TspResult> getBestResult(String name) {
+    return Optional.ofNullable(bestResults.get(name));
+  }
+
+  public int getCompleted(String name) {
+    AtomicInteger c = completedCounts.get(name);
+    return c == null ? 0 : c.get();
+  }
+
+  public int getTotal(String name) {
+    AtomicInteger t = totalCounts.get(name);
+    return t == null ? 0 : t.get();
+  }
+
   @Override
   public void firePropertyChange(String propertyName, Object oldValue, Object newValue) {
     super.firePropertyChange(propertyName, oldValue, newValue);
+  }
+
+  // -------------------------------------------------------------------------
+  // Nested types
+  // -------------------------------------------------------------------------
+
+  public static class BatchInfo {
+    public final String name;
+    public final int total;
+    BatchInfo(String name, int total) { this.name = name; this.total = total; }
   }
 }

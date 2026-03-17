@@ -2,20 +2,25 @@ import java.io.File;
 import java.io.IOException;
 
 /**
- * Producer thread: loads a TSPLIB .tsp file and enqueues it in the shared
- * {@link TspProblemRepository}. Running this on its own thread means the
- * GUI stays responsive even when parsing large files — the EDT (Event
- * Dispatch Thread) is never blocked.
+ * Producer thread: loads a TSPLIB .tsp file and enqueues one sub-problem
+ * per starting city into the shared {@link TspProblemRepository}.
  *
- * The producer is gated by Semaphore A (empty slots) inside the repository:
- * if the buffer is full it blocks here, never in the GUI.
+ * <h3>Why one sub-problem per city?</h3>
+ * The Nearest Neighbor heuristic is sensitive to the starting city — a
+ * different start often yields a significantly shorter tour. By splitting
+ * the file into N sub-problems (one per city), we let local and remote
+ * workers explore all N starting points in parallel. The repository tracks
+ * the best tour across all results and notifies the GUI whenever a new
+ * champion is found.
  *
- * Design note: one TspProducer is created per file load. This is intentional —
- * it keeps the producer stateless and easy to reason about. A pool of
- * persistent producers would add complexity with no benefit for this workload.
+ * <h3>Threading model</h3>
+ * Running on its own thread keeps the EDT (Event Dispatch Thread)
+ * responsive even for large files. The producer blocks inside
+ * {@link TspProblemRepository#produce} if the buffer is full — it never
+ * blocks the GUI.
  *
  * @author ryanschmitt
- * @version 1.0
+ * @version 2.0
  */
 public class TspProducer implements Runnable {
 
@@ -30,14 +35,12 @@ public class TspProducer implements Runnable {
   @Override
   public void run() {
     try {
-      // loadFromFile parses the .tsp file then calls produce(), which:
-      //   1. acquires Semaphore A (blocks if buffer is full)
-      //   2. locks the queue, enqueues, unlocks
-      //   3. releases Semaphore B (signals consumer)
+      // loadFromFile parses the .tsp file, registers a batch, then
+      // calls produce() once per city — each produce() follows the
+      // six-step semaphore protocol inside the repository.
       repository.loadFromFile(file);
     } catch (IOException e) {
-      // Fire an error event so the GUI can display it without us touching Swing.
-      repository.firePropertyChange("error", null, e.getMessage());
+      repository.firePropertyChange(TspProblemRepository.EVENT_ERROR, null, e.getMessage());
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }

@@ -1,25 +1,17 @@
 import java.util.List;
 
 /**
- * Consumer thread: repeatedly dequeues TSP problems from the shared
- * {@link TspProblemRepository}, solves them with the Nearest Neighbor
- * heuristic, and fires the result as a PropertyChangeEvent.
+ * Local consumer thread: competes with the Outsourcer for tasks from the
+ * shared queue, and also drains the fallback local queue for tasks that
+ * timed out on remote workers.
  *
- * The consumer is gated by Semaphore B (filled slots) inside the repository:
- * it blocks on {@code getNextProblem()} when the buffer is empty, consuming
- * zero CPU while it waits. When a result is ready it fires a "result" property
- * change on the repository; {@link TspFrameOld} listens for this and updates the
- * UI on the EDT via SwingUtilities.invokeLater.
- *
- * Design note: this thread runs in an infinite loop with a volatile flag so
- * that the GUI can stop it cleanly (e.g. on window close) without using the
- * deprecated Thread.stop(). The loop will also exit naturally if interrupted.
- *
- * Multiple TspSolver instances can run concurrently — each will race to grab
- * the next problem from the buffer, giving true parallel solving.
+ * <p>Both queues are serviced by a single loop. The thread tries the shared
+ * queue first (blocking until a task is available), solves it locally, then
+ * immediately checks whether any fallback tasks have piled up. This keeps
+ * local CPU fully utilized regardless of how many remote workers are active.
  *
  * @author ryanschmitt
- * @version 1.0
+ * @version 4.0
  */
 public class TspSolver implements Runnable {
 
@@ -30,35 +22,52 @@ public class TspSolver implements Runnable {
     this.repository = repository;
   }
 
-  /** Ask the thread to stop after it finishes its current problem. */
-  public void stop() {
-    running = false;
-  }
+  public void stop() { running = false; }
 
   @Override
   public void run() {
     while (running) {
       try {
-        // 1. Acquire Semaphore B (blocks if buffer is empty)
-        // 2. Lock, dequeue, unlock  — all inside getNextProblem()
-        // 3. Semaphore A (empty slots) is released by getNextProblem()
-        TspProblem problem = repository.getNextProblem();
+        // Pull from whichever queue has work — shared queue first, then fallback.
+        // getNextProblem() blocks until a task is available.
+        TspProblem problem = nextProblem();
+        if (problem == null) continue;
 
-        // Solve 
+        System.out.printf("[SOLVING]   (local) problem=%s  start=%d  cities=%d%n",
+            problem.getName(), problem.getStartIndex(), problem.getCities().size());
+
         List<Integer> tour = NearestNeighborSolver.solve(
-            problem.getCities(), 0);
-        double length = NearestNeighborSolver.length(
-            problem.getCities(), tour);
+            problem.getCities(), problem.getStartIndex());
+        double length = NearestNeighborSolver.length(problem.getCities(), tour);
 
-        TspResult result = new TspResult(problem, tour, length);
+        System.out.printf("[SOLVED]    (local) problem=%s  start=%d  length=%.3f%n",
+            problem.getName(), problem.getStartIndex(), length);
 
-        // Fire result back — TspFrame listens and calls SwingUtilities.invokeLater
-        repository.firePropertyChange("result", null, result);
+        repository.submitResult(new TspResult(problem, tour, length, problem.getStartIndex()));
 
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
         break;
       }
     }
+  }
+
+  /**
+   * Returns the next problem to solve. Drains the fallback local queue
+   * (non-blocking) first; if empty, blocks on the shared queue.
+   * This means timed-out remote tasks are handled immediately, while
+   * normal throughput comes from the shared queue.
+   */
+  private TspProblem nextProblem() throws InterruptedException {
+    // Non-blocking check of fallback queue first
+    if (repository.localQueueSize() > 0) {
+      try {
+        return repository.getNextLocalFallback();
+      } catch (Exception ignored) {
+        // Race: another solver grabbed it first — fall through to shared queue
+      }
+    }
+    // Block on the shared queue (competes with the Outsourcer)
+    return repository.getNextProblem();
   }
 }
