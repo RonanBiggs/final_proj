@@ -10,17 +10,22 @@ import java.util.concurrent.*;
 
 /**
  * Outsourcer: listens for worker task requests and fulfils them by dequeuing
- * tasks from the repository and publishing directly to each worker's personal topic.
+ * tasks from the repository and publishing directly to each worker's personal
+ * topic.
  *
  * <h3>Protocol</h3>
- * Workers publish to {@code tsp/<session>/requests} saying how many tasks they want
- * and which topic to deliver them to. The Outsourcer dequeues that many tasks and
- * publishes each one directly to the worker's personal topic. Results come back on
+ * Workers publish to {@code tsp/<session>/requests} saying how many tasks they
+ * want
+ * and which topic to deliver them to. The Outsourcer dequeues that many tasks
+ * and
+ * publishes each one directly to the worker's personal topic. Results come back
+ * on
  * {@code tsp/<session>/results} as before.
  *
  * <h3>Local solver competition</h3>
  * The Outsourcer still competes with local TspSolver threads for tasks from the
- * shared queue. Each task the Outsourcer wins goes to a remote worker; tasks local
+ * shared queue. Each task the Outsourcer wins goes to a remote worker; tasks
+ * local
  * solvers win are solved in-process. Timeout fallback still applies per-task.
  *
  * @author javiergs / ryanschmitt
@@ -35,34 +40,31 @@ public class Outsourcer implements Runnable, MqttCallback, AutoCloseable {
   private final String outsourcerId;
   private final String sessionId;
   private final String sessionTag;
-  private final String requestTopic;   // tsp/<session>/requests  — inbound worker requests
-  private final String resultTopic;    // tsp/<session>/results   — inbound remote results
+  private final String requestTopic;
+  private final String resultTopic;
   private final MqttClient client;
   private volatile boolean running = true;
 
-  /** Pending requests from workers: workerId → WorkerRequest, waiting for tasks to dequeue */
   private final LinkedBlockingQueue<WorkerRequest> pendingRequests = new LinkedBlockingQueue<>();
 
-  /** In-flight remote tasks: requestId → InFlightTask, for timeout tracking */
   private final ConcurrentHashMap<String, InFlightTask> inFlight = new ConcurrentHashMap<>();
 
-  private final ScheduledExecutorService timeoutScheduler =
-      Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread t = new Thread(r, "Outsourcer-Timeout");
-        t.setDaemon(true);
-        return t;
-      });
+  private final ScheduledExecutorService timeoutScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+    Thread t = new Thread(r, "Outsourcer-Timeout");
+    t.setDaemon(true);
+    return t;
+  });
 
   public Outsourcer(TspProblemRepository repository, String brokerUrl,
-                    String outsourcerId, String sessionId) throws MqttException {
-    this.repository   = repository;
-    this.brokerUrl    = brokerUrl;
+      String outsourcerId, String sessionId) throws MqttException {
+    this.repository = repository;
+    this.brokerUrl = brokerUrl;
     this.outsourcerId = outsourcerId;
-    this.sessionId    = sessionId;
-    this.sessionTag   = sessionId.length() >= 8 ? sessionId.substring(0, 8) : sessionId;
+    this.sessionId = sessionId;
+    this.sessionTag = sessionId.length() >= 8 ? sessionId.substring(0, 8) : sessionId;
     this.requestTopic = "tsp/" + sessionId + "/requests";
-    this.resultTopic  = "tsp/" + sessionId + "/results";
-    this.client       = new MqttClient(brokerUrl, outsourcerId);
+    this.resultTopic = "tsp/" + sessionId + "/results";
+    this.client = new MqttClient(brokerUrl, outsourcerId);
     this.client.setCallback(this);
   }
 
@@ -82,20 +84,21 @@ public class Outsourcer implements Runnable, MqttCallback, AutoCloseable {
       System.out.println("[Outsourcer] Results  : " + resultTopic);
       System.out.println("[Outsourcer] Timeout  : " + REMOTE_TIMEOUT_MS + " ms");
 
-      // Main loop: block waiting for a worker request, then fulfil it
+      // Block waiting for a worker request, then fulfil it
       while (running && !Thread.currentThread().isInterrupted()) {
         WorkerRequest req = pendingRequests.poll(500, TimeUnit.MILLISECONDS);
-        if (req == null) continue;
+        if (req == null)
+          continue;
 
         System.out.printf("[Outsourcer] Fulfilling request from %s — %d tasks → %s%n",
             req.workerId, req.capacity, req.taskTopic);
 
         for (int i = 0; i < req.capacity; i++) {
-          if (!running) break;
+          if (!running)
+            break;
 
-          // Compete with local solvers for the next task
-          TspProblem problem   = repository.getNextProblem();
-          String     requestId = UUID.randomUUID().toString();
+          TspProblem problem = repository.getNextProblem();
+          String requestId = UUID.randomUUID().toString();
 
           InFlightTask inFlightTask = new InFlightTask(problem, requestId, req.workerId);
           inFlight.put(requestId, inFlightTask);
@@ -103,7 +106,6 @@ public class Outsourcer implements Runnable, MqttCallback, AutoCloseable {
           inFlightTask.timeoutFuture = timeoutScheduler.schedule(
               () -> handleTimeout(requestId), REMOTE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
 
-          // Encode task WITHOUT resultTopic field — worker already knows its resultTopic
           String payload = encodeWorkItem(requestId, problem);
           MqttMessage msg = new MqttMessage(payload.getBytes(StandardCharsets.UTF_8));
           msg.setQos(1);
@@ -123,14 +125,18 @@ public class Outsourcer implements Runnable, MqttCallback, AutoCloseable {
       System.err.println("[Outsourcer] Failure: " + e.getMessage());
       e.printStackTrace();
     } finally {
-      try { close(); } catch (Exception ignored) { }
+      try {
+        close();
+      } catch (Exception ignored) {
+      }
       System.out.println("[Outsourcer] Stopped.");
     }
   }
 
   private void handleTimeout(String requestId) {
     InFlightTask task = inFlight.remove(requestId);
-    if (task == null) return;
+    if (task == null)
+      return;
 
     System.out.printf("[Fallback] (remote) Outsourcer   [%s]  problem=%s  start=%d  — timeout, queuing locally%n",
         sessionTag, task.problem.getName(), task.problem.getStartIndex());
@@ -142,11 +148,9 @@ public class Outsourcer implements Runnable, MqttCallback, AutoCloseable {
     }
   }
 
-  public void stop() { running = false; }
-
-  // -------------------------------------------------------------------------
-  // MqttCallback
-  // -------------------------------------------------------------------------
+  public void stop() {
+    running = false;
+  }
 
   @Override
   public void connectionLost(Throwable cause) {
@@ -161,14 +165,14 @@ public class Outsourcer implements Runnable, MqttCallback, AutoCloseable {
       String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
 
       if (topic.equals(requestTopic)) {
-        // A worker is asking for tasks
+        // Awaiting task
         WorkerRequest req = decodeRequest(payload);
         System.out.printf("[Outsourcer] Request received from %s — wants %d tasks%n",
             req.workerId, req.capacity);
         pendingRequests.add(req);
 
       } else if (topic.equals(resultTopic)) {
-        // A worker finished a task
+        // Finished task
         DecodedResult decoded = decodeResult(payload);
 
         InFlightTask task = inFlight.remove(decoded.requestId);
@@ -178,14 +182,15 @@ public class Outsourcer implements Runnable, MqttCallback, AutoCloseable {
           return;
         }
 
-        if (task.timeoutFuture != null) task.timeoutFuture.cancel(false);
+        if (task.timeoutFuture != null)
+          task.timeoutFuture.cancel(false);
 
         System.out.printf("[Solved]   (remote) %-12s  [%s]  problem=%s  start=%d  length=%.3f%n",
             decoded.workerId, sessionTag,
             decoded.problem.getName(), decoded.startIndex, decoded.length);
 
         repository.submitResult(new TspResult(decoded.problem, decoded.tour,
-                                               decoded.length, decoded.startIndex));
+            decoded.length, decoded.startIndex));
       }
 
     } catch (Exception e) {
@@ -197,21 +202,18 @@ public class Outsourcer implements Runnable, MqttCallback, AutoCloseable {
   }
 
   @Override
-  public void deliveryComplete(IMqttDeliveryToken token) { /* no-op */ }
+  public void deliveryComplete(IMqttDeliveryToken token) {
+    /* no-op */ }
 
   @Override
   public void close() throws MqttException {
     running = false;
     timeoutScheduler.shutdownNow();
-    if (client.isConnected()) client.disconnect();
+    if (client.isConnected())
+      client.disconnect();
     client.close();
   }
 
-  // -------------------------------------------------------------------------
-  // Wire encoding / decoding
-  // -------------------------------------------------------------------------
-
-  /** Task payload sent to a worker's personal topic (no resultTopic field needed). */
   private static String encodeWorkItem(String requestId, TspProblem problem) {
     StringBuilder sb = new StringBuilder();
     sb.append("requestId=").append(escape(requestId)).append('\n');
@@ -220,28 +222,28 @@ public class Outsourcer implements Runnable, MqttCallback, AutoCloseable {
     sb.append("cityCount=").append(problem.getCities().size()).append('\n');
     for (City city : problem.getCities()) {
       sb.append(city.getId()).append('|')
-        .append(city.getX()).append('|')
-        .append(city.getY()).append('\n');
+          .append(city.getX()).append('|')
+          .append(city.getY()).append('\n');
     }
     return sb.toString();
   }
 
   private static WorkerRequest decodeRequest(String payload) {
-    String[] lines   = payload.split("\\R");
-    String workerId  = unescape(valueOf(lines[0], "workerId="));
-    int    capacity  = Integer.parseInt(valueOf(lines[1], "capacity="));
+    String[] lines = payload.split("\\R");
+    String workerId = unescape(valueOf(lines[0], "workerId="));
+    int capacity = Integer.parseInt(valueOf(lines[1], "capacity="));
     String taskTopic = unescape(valueOf(lines[2], "taskTopic="));
     return new WorkerRequest(workerId, capacity, taskTopic);
   }
 
   private static DecodedResult decodeResult(String payload) {
-    String[] lines   = payload.split("\\R");
+    String[] lines = payload.split("\\R");
     String requestId = unescape(valueOf(lines[0], "requestId="));
-    String workerId  = unescape(valueOf(lines[1], "workerId="));
-    String name      = unescape(valueOf(lines[2], "name="));
-    double length    = Double.parseDouble(valueOf(lines[3], "length="));
-    int startIndex   = Integer.parseInt(valueOf(lines[4], "startIndex="));
-    int cityCount    = Integer.parseInt(valueOf(lines[5], "cityCount="));
+    String workerId = unescape(valueOf(lines[1], "workerId="));
+    String name = unescape(valueOf(lines[2], "name="));
+    double length = Double.parseDouble(valueOf(lines[3], "length="));
+    int startIndex = Integer.parseInt(valueOf(lines[4], "startIndex="));
+    int cityCount = Integer.parseInt(valueOf(lines[5], "cityCount="));
 
     List<City> cities = new ArrayList<>();
     int idx = 6;
@@ -270,20 +272,22 @@ public class Outsourcer implements Runnable, MqttCallback, AutoCloseable {
     return line.substring(prefix.length());
   }
 
-  private static String escape(String v)   { return URLEncoder.encode(v, StandardCharsets.UTF_8); }
-  private static String unescape(String v) { return URLDecoder.decode(v, StandardCharsets.UTF_8); }
+  private static String escape(String v) {
+    return URLEncoder.encode(v, StandardCharsets.UTF_8);
+  }
 
-  // -------------------------------------------------------------------------
-  // Inner types
-  // -------------------------------------------------------------------------
+  private static String unescape(String v) {
+    return URLDecoder.decode(v, StandardCharsets.UTF_8);
+  }
 
   private static class WorkerRequest {
     final String workerId;
-    final int    capacity;
+    final int capacity;
     final String taskTopic;
+
     WorkerRequest(String workerId, int capacity, String taskTopic) {
-      this.workerId  = workerId;
-      this.capacity  = capacity;
+      this.workerId = workerId;
+      this.capacity = capacity;
       this.taskTopic = taskTopic;
     }
   }
@@ -293,10 +297,11 @@ public class Outsourcer implements Runnable, MqttCallback, AutoCloseable {
     final String requestId;
     final String workerId;
     volatile ScheduledFuture<?> timeoutFuture;
+
     InFlightTask(TspProblem problem, String requestId, String workerId) {
-      this.problem   = problem;
+      this.problem = problem;
       this.requestId = requestId;
-      this.workerId  = workerId;
+      this.workerId = workerId;
     }
   }
 
@@ -306,13 +311,14 @@ public class Outsourcer implements Runnable, MqttCallback, AutoCloseable {
     final List<Integer> tour;
     final double length;
     final int startIndex;
+
     DecodedResult(String requestId, String workerId, TspProblem problem,
-                  List<Integer> tour, double length, int startIndex) {
-      this.requestId  = requestId;
-      this.workerId   = workerId;
-      this.problem    = problem;
-      this.tour       = tour;
-      this.length     = length;
+        List<Integer> tour, double length, int startIndex) {
+      this.requestId = requestId;
+      this.workerId = workerId;
+      this.problem = problem;
+      this.tour = tour;
+      this.length = length;
       this.startIndex = startIndex;
     }
   }

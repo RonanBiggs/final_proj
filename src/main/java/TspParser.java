@@ -16,7 +16,8 @@ public class TspParser {
       boolean inNodes = false;
       while ((line = br.readLine()) != null) {
         line = line.trim();
-        if (line.isEmpty()) continue;
+        if (line.isEmpty())
+          continue;
         if (!inNodes) {
           if (line.equalsIgnoreCase("NODE_COORD_SECTION")) {
             inNodes = true;
@@ -29,7 +30,8 @@ public class TspParser {
           break;
         }
         String[] parts = line.split("\\s+");
-        if (parts.length < 3) continue;
+        if (parts.length < 3)
+          continue;
 
         int id = Integer.parseInt(parts[0]);
         double x = Double.parseDouble(parts[1]);

@@ -16,30 +16,30 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class TspFrame extends JFrame implements PropertyChangeListener {
 
-  private static final String MQTT_BROKER            = "tcp://broker.hivemq.com:1883";
-  private static final int    LOCAL_SOLVER_COUNT      = 10;
-  private static final int    REMOTE_WORKER_COUNT     = 0;  // in-process remote workers
-  /** How many tasks each in-process remote worker requests at a time. */
-  private static final int    REMOTE_TASK_BATCH_SIZE  = 5;
+  private static final String MQTT_BROKER = "tcp://broker.hivemq.com:1883";
+  private static final int LOCAL_SOLVER_COUNT = 10;
+  private static final int REMOTE_WORKER_COUNT = 0; // in-process remote workers
+  private static final int REMOTE_TASK_BATCH_SIZE = 5;
 
-  private static final String SESSION_ID  = "dolphin27";
+  private static final String SESSION_ID = "dolphin27";
   private static final String SESSION_TAG = SESSION_ID.length() >= 8
-      ? SESSION_ID.substring(0, 8) : SESSION_ID;
+      ? SESSION_ID.substring(0, 8)
+      : SESSION_ID;
 
   private final TspProblemRepository repository = TspProblemRepository.getInstance();
 
-  private final MapPanel  mapPanel      = new MapPanel();
-  private final JTextArea log           = new JTextArea(10, 70);
-  private final JLabel    statusLabel   = new JLabel("Ready");
-  private final JLabel    progressLabel = new JLabel("");
+  private final MapPanel mapPanel = new MapPanel();
+  private final JTextArea log = new JTextArea(10, 70);
+  private final JLabel statusLabel = new JLabel("Ready");
+  private final JLabel progressLabel = new JLabel("");
 
   private List<City> currentCities = List.of();
-  private final List<Thread>       workerThreads = new ArrayList<>();
-  private final List<TspSolver>    localSolvers  = new ArrayList<>();
+  private final List<Thread> workerThreads = new ArrayList<>();
+  private final List<TspSolver> localSolvers = new ArrayList<>();
   private final List<RemoteWorker> remoteWorkers = new ArrayList<>();
   private Outsourcer outsourcer;
 
-  private final Map<String, Integer> batchTotals    = new LinkedHashMap<>();
+  private final Map<String, Integer> batchTotals = new LinkedHashMap<>();
   private final Map<String, Integer> batchCompleted = new ConcurrentHashMap<>();
 
   public TspFrame() {
@@ -54,7 +54,7 @@ public class TspFrame extends JFrame implements PropertyChangeListener {
     log.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
     log.setBackground(new Color(245, 255, 245));
 
-    JButton loadBtn  = new JButton("Load .tsp");
+    JButton loadBtn = new JButton("Load .tsp");
     JButton clearBtn = new JButton("Clear tour");
     loadBtn.addActionListener(e -> onLoad());
     clearBtn.addActionListener(e -> onClear());
@@ -80,7 +80,10 @@ public class TspFrame extends JFrame implements PropertyChangeListener {
 
     setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
     addWindowListener(new java.awt.event.WindowAdapter() {
-      @Override public void windowClosing(java.awt.event.WindowEvent e) { stopWorkers(); }
+      @Override
+      public void windowClosing(java.awt.event.WindowEvent e) {
+        stopWorkers();
+      }
     });
     setSize(1000, 750);
     setLocationRelativeTo(null);
@@ -88,7 +91,7 @@ public class TspFrame extends JFrame implements PropertyChangeListener {
 
   private void startWorkers() {
     for (int i = 0; i < LOCAL_SOLVER_COUNT; i++) {
-      String label  = "Local-" + (i + 1);
+      String label = "Local-" + (i + 1);
       TspSolver solver = new TspSolver(repository, label, SESSION_TAG);
       Thread t = new Thread(solver, label);
       t.setDaemon(true);
@@ -130,11 +133,17 @@ public class TspFrame extends JFrame implements PropertyChangeListener {
     localSolvers.forEach(TspSolver::stop);
     if (outsourcer != null) {
       outsourcer.stop();
-      try { outsourcer.close(); } catch (Exception ignored) { }
+      try {
+        outsourcer.close();
+      } catch (Exception ignored) {
+      }
     }
     remoteWorkers.forEach(w -> {
       w.stop();
-      try { w.close(); } catch (Exception ignored) { }
+      try {
+        w.close();
+      } catch (Exception ignored) {
+      }
     });
     workerThreads.forEach(Thread::interrupt);
   }
@@ -144,7 +153,8 @@ public class TspFrame extends JFrame implements PropertyChangeListener {
     chooser.setDialogTitle("Select one or more TSPLIB .tsp files");
     chooser.setMultiSelectionEnabled(true);
     chooser.setFileFilter(new FileNameExtensionFilter("TSPLIB (*.tsp)", "tsp"));
-    if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+    if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION)
+      return;
 
     for (File file : chooser.getSelectedFiles()) {
       appendLog("Loading  : " + file.getName());
@@ -177,13 +187,14 @@ public class TspFrame extends JFrame implements PropertyChangeListener {
         });
       }
 
-      case TspProblemRepository.EVENT_PROBLEM -> { /* too noisy */ }
+      case TspProblemRepository.EVENT_PROBLEM -> {
+        /* too noisy */ }
 
       case TspProblemRepository.EVENT_RESULT -> {
         TspResult result = (TspResult) evt.getNewValue();
         SwingUtilities.invokeLater(() -> {
           String name = result.getProblem().getName();
-          int done  = batchCompleted.merge(name, 1, Integer::sum);
+          int done = batchCompleted.merge(name, 1, Integer::sum);
           int total = batchTotals.getOrDefault(name, 0);
           progressLabel.setText(done + " / " + total);
         });
@@ -196,9 +207,9 @@ public class TspFrame extends JFrame implements PropertyChangeListener {
           mapPanel.setCities(result.getProblem().getCities());
           mapPanel.setTour(result.getTour());
 
-          String name  = result.getProblem().getName();
-          int done     = batchCompleted.getOrDefault(name, 0);
-          int total    = batchTotals.getOrDefault(name, 0);
+          String name = result.getProblem().getName();
+          int done = batchCompleted.getOrDefault(name, 0);
+          int total = batchTotals.getOrDefault(name, 0);
 
           appendLog(String.format("★ Best   : %s  start=%d  length=%.3f  (%d/%d)",
               name, result.getStartIndex(), result.getLength(), done, total));
