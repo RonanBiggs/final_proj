@@ -1,11 +1,5 @@
 import java.awt.*;
 
-/**
- * Represents a city with an ID and (x, y) coordinates.
- *
- * @author javiergs
- * @version 2.0
- */
 public class City {
 
   private final int id;

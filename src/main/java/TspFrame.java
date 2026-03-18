@@ -8,12 +8,6 @@ import java.util.*;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * Main application window.
- *
- * @author javiergs / ryanschmitt
- * @version 5.0
- */
 public class TspFrame extends JFrame implements PropertyChangeListener {
 
   private static final String MQTT_BROKER = "tcp://broker.hivemq.com:1883";

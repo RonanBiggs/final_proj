@@ -9,28 +9,6 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/**
- * Remote MQTT worker that requests a fixed batch of tasks at a time.
- *
- * <h3>Protocol</h3>
- * <ol>
- * <li>Worker publishes a request to {@code tsp/<session>/requests}:
- * {@code workerId=<label>  capacity=<n>  taskTopic=tsp/<session>/worker/<label>/tasks}</li>
- * <li>Outsourcer receives the request, dequeues {@code n} tasks, and publishes
- * each to {@code tsp/<session>/worker/<label>/tasks}.</li>
- * <li>Worker solves each task and publishes results to
- * {@code tsp/<session>/results}.</li>
- * <li>Once all tasks in the batch are done, worker publishes another
- * request.</li>
- * </ol>
- *
- * <h3>Batch size</h3>
- * Set {@code TASK_BATCH_SIZE} before running. Each worker can have a different
- * value.
- *
- * @author javiergs / ryanschmitt
- * @version 6.0
- */
 public class RemoteWorker implements Runnable, MqttCallback, AutoCloseable {
 
   private static final int TASK_BATCH_SIZE = 4;
